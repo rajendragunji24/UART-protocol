@@ -2,7 +2,6 @@
 
 `include "interface.sv"
 `include "environment.sv"
-// `include "uart_design.sv"  // Uncomment if all design files are in one file
 
 module testbench;
 
@@ -12,34 +11,37 @@ module testbench;
   logic clk;
   logic rst;
 
-  // 100 MHz clock (10 ns period)
   initial clk = 0;
-  always #5 clk = ~clk;
+  always #5 clk = ~clk;   // 100 MHz
 
-  // Reset generation
   initial begin
     rst = 1;
-    #20;
-    rst = 0; // release reset after 20 ns
+    #20 rst = 0;
   end
 
+
   //---------------------------------------------
-  // INTERFACE INSTANTIATION
+  // INTERFACE
   //---------------------------------------------
   uart_if uart_if_inst (clk, rst);
 
+
   //---------------------------------------------
-  // DUT CONNECTIONS
+  // BAUD GENERATOR
   //---------------------------------------------
   logic tx_enb, rx_enb;
-  baud_rate_generator baud_gen (
-    .clk    (clk),
-    .rst_n  (~rst),
-    .tx_enb (tx_enb),
-    .rx_enb (rx_enb)
+
+  baud_rate_generator #(.TX_DIV(10), .RX_DIV(10)) baud_gen (
+    .clk   (clk),
+    .rst_n (~rst),
+    .tx_enb(tx_enb),
+    .rx_enb(rx_enb)
   );
 
-  // TX internal signals
+
+  //---------------------------------------------
+  // TX PATH
+  //---------------------------------------------
   logic parity_bit, load, shift;
   logic [1:0] sel;
   logic data_bit;
@@ -58,10 +60,12 @@ module testbench;
     .serial_out (data_bit)
   );
 
+  // *** Corrected TX FSM ***
   tx_fsm u_tx_fsm (
     .clk        (clk),
     .rst        (rst),
     .TXstart    (uart_if_inst.TXstart),
+    .tx_enb     (tx_enb),        // << required
     .parity_bit (parity_bit),
     .data_bit   (data_bit),
     .load       (load),
@@ -70,23 +74,23 @@ module testbench;
     .TX_busy    (uart_if_inst.TX_busy)
   );
 
-  // TX output line
   logic tx_line;
   always_comb begin
     case (sel)
-      2'b00: tx_line = 1'b0;        // Start bit
-      2'b01: tx_line = data_bit;    // Data bits
-      2'b10: tx_line = parity_bit;  // Parity bit
-      2'b11: tx_line = 1'b1;        // Stop bit
+      2'b00: tx_line = 1'b0;         // start
+      2'b01: tx_line = data_bit;     // data
+      2'b10: tx_line = parity_bit;   // parity
+      2'b11: tx_line = 1'b1;         // stop/idle
       default: tx_line = 1'b1;
     endcase
   end
 
   assign uart_if_inst.TX_data_out = tx_line;
-  assign uart_if_inst.RX_in       = tx_line; // loopback
+  assign uart_if_inst.RX_in       = tx_line;     // loopback
+
 
   //---------------------------------------------
-  // RX path
+  // RX PATH
   //---------------------------------------------
   logic start_detected, shift_rx, parity_check, stop_check;
 
@@ -106,12 +110,12 @@ module testbench;
   );
 
   parity_check_simple u_parity_chk (
-    .clk           (clk),
-    .rst           (rst),
-    .check         (parity_check),
-    .data_in       (uart_if_inst.RX_data_out),
-    .sampled_parity(uart_if_inst.RX_in),
-    .parity_err    (uart_if_inst.parity_err)
+    .clk            (clk),
+    .rst            (rst),
+    .check          (parity_check),
+    .data_in        (uart_if_inst.RX_data_out),
+    .sampled_parity (uart_if_inst.RX_in),
+    .parity_err     (uart_if_inst.parity_err)
   );
 
   stop_check_simple u_stop_chk (
@@ -134,17 +138,41 @@ module testbench;
     .data_ready    (uart_if_inst.data_ready)
   );
 
+
   //---------------------------------------------
   // ENVIRONMENT
   //---------------------------------------------
   uart_env env;
   initial begin
     env = new(uart_if_inst);
-    env.run(); // optional
+    env.run();
   end
 
+
   //---------------------------------------------
-  // MANUAL TEST STIMULUS
+  // SEND TASK (BAUD-ALIGNED)
+  //---------------------------------------------
+  task automatic send_byte(input logic [7:0] b);
+  begin
+    // wait for transmitter to be idle
+    wait (!uart_if_inst.TX_busy);
+
+    // put data on interface before asserting start
+    uart_if_inst.TX_data_in = b;
+
+    // align assertion to baud boundary
+    @(posedge tx_enb);
+    uart_if_inst.TXstart = 1;
+
+    // hold TXstart for 1 baud tick so FSM sees it on a tx_enb
+    @(posedge tx_enb);
+    uart_if_inst.TXstart = 0;
+  end
+  endtask
+
+
+  //---------------------------------------------
+  // MANUAL STIMULUS (USING send_byte)
   //---------------------------------------------
   initial begin
     @(negedge rst);
@@ -152,65 +180,49 @@ module testbench;
 
     $display("\n=== UART TEST STARTED ===");
 
-    // 1️⃣ First Byte
-    wait (!uart_if_inst.TX_busy);
-    @(posedge clk);
-    uart_if_inst.TX_data_in = 8'hA5;
-    uart_if_inst.TXstart = 1;
-    @(posedge clk);
-    uart_if_inst.TXstart = 0;
-    $display("[%0t ns] Sent first byte: 0xA5", $time);
-
-    wait (!uart_if_inst.TX_busy);
-    repeat (5) @(posedge clk);
-
-    // 2️⃣ Second Byte
-    uart_if_inst.TX_data_in = 8'h3C;
-    uart_if_inst.TXstart = 1;
-    @(posedge clk);
-    uart_if_inst.TXstart = 0;
-    $display("[%0t ns] Sent second byte: 0x3C", $time);
-
+    send_byte(8'hA5);
     wait (uart_if_inst.data_ready);
-    $display("[%0t ns] Data received: 0x%0h", $time, uart_if_inst.RX_data_out);
+    $display("[%0t ns] RX: %02h", $time, uart_if_inst.RX_data_out);
 
-    wait (!uart_if_inst.TX_busy);
-    repeat (5) @(posedge clk);
-
-    // 3️⃣ Third Byte
-    uart_if_inst.TX_data_in = 8'hF0;
-    uart_if_inst.TXstart = 1;
-    @(posedge clk);
-    uart_if_inst.TXstart = 0;
-    $display("[%0t ns] Sent third byte: 0xF0", $time);
-
+    send_byte(8'h3C);
     wait (uart_if_inst.data_ready);
-    $display("[%0t ns] Final Data received: 0x%0h", $time, uart_if_inst.RX_data_out);
+    $display("[%0t ns] RX: %02h", $time, uart_if_inst.RX_data_out);
 
-        #50000;
-    $display("=== UART TEST COMPLETED ===\n");
+    send_byte(8'hF0);
+    wait (uart_if_inst.data_ready);
+    $display("[%0t ns] RX: %02h", $time, uart_if_inst.RX_data_out);
+
+    #20000;
+    $display("\n=== UART TEST COMPLETED ===");
     $finish;
-  end  // <- closes the manual stimulus initial block
+  end
 
 
   //---------------------------------------------
-  // COVERAGE DISPLAY BLOCK
+  // COVERAGE DISPLAY BLOCK  (FULLY ENABLED)
   //---------------------------------------------
   initial begin
     #100000;
+
     $display("============================================");
-    $display(" UART Transaction Coverage = %0.2f%%", env.mon.tr.trans_cov.get_coverage());
-    $display(" Overall Coverage          = %0.2f%%", $get_coverage());
+    if (env.mon.tr.trans_cov != null)
+      $display(" UART Transaction Coverage = %0.2f%%",
+               env.mon.tr.trans_cov.get_coverage());
+    else
+      $display(" UART Transaction Coverage = Monitor not enabled");
+
+    $display(" Overall Coverage          = %0.2f%%",
+             $get_coverage());
     $display("============================================");
   end
 
 
   //---------------------------------------------
-  // WAVEFORM DUMP
+  // WAVEFORM
   //---------------------------------------------
   initial begin
     $dumpfile("uart_wave.vcd");
-    $dumpvars(1, testbench);
+    $dumpvars(0, testbench);
   end
 
 endmodule
